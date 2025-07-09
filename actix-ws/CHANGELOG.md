@@ -6,7 +6,8 @@
 
 ## 0.4.0
 
-- Implement `Sink` for `Session`
+- Implement `Sink` for `Session`.
+- The `Session::close` no longer closes the session but instead only sends a close message.
 
 ## 0.3.0
 
