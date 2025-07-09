@@ -1,22 +1,26 @@
 use std::{
     fmt,
+    pin::Pin,
     sync::{
         atomic::{AtomicBool, Ordering},
         Arc,
     },
+    task::{Context, Poll},
 };
 
 use actix_http::ws::{CloseReason, Item, Message};
 use actix_web::web::Bytes;
 use bytestring::ByteString;
-use tokio::sync::mpsc::Sender;
+use futures_sink::Sink;
+use futures_util::SinkExt;
+use tokio_util::sync::PollSender;
 
 /// A handle into the websocket session.
 ///
 /// This type can be used to send messages into the WebSocket.
 #[derive(Clone)]
 pub struct Session {
-    inner: Option<Sender<Message>>,
+    inner: PollSender<Message>,
     closed: Arc<AtomicBool>,
 }
 
@@ -33,16 +37,16 @@ impl fmt::Display for Closed {
 impl std::error::Error for Closed {}
 
 impl Session {
-    pub(super) fn new(inner: Sender<Message>) -> Self {
+    pub(super) fn new(inner: PollSender<Message>) -> Self {
         Session {
-            inner: Some(inner),
+            inner,
             closed: Arc::new(AtomicBool::new(false)),
         }
     }
 
     fn pre_check(&mut self) {
         if self.closed.load(Ordering::Relaxed) {
-            self.inner.take();
+            self.inner.close();
         }
     }
 
@@ -58,14 +62,11 @@ impl Session {
     /// ```
     pub async fn text(&mut self, msg: impl Into<ByteString>) -> Result<(), Closed> {
         self.pre_check();
-        if let Some(inner) = self.inner.as_mut() {
-            inner
-                .send(Message::Text(msg.into()))
-                .await
-                .map_err(|_| Closed)
-        } else {
-            Err(Closed)
-        }
+
+        self.inner
+            .send(Message::Text(msg.into()))
+            .await
+            .map_err(|_| Closed)
     }
 
     /// Sends raw bytes into the WebSocket.
@@ -80,14 +81,11 @@ impl Session {
     /// ```
     pub async fn binary(&mut self, msg: impl Into<Bytes>) -> Result<(), Closed> {
         self.pre_check();
-        if let Some(inner) = self.inner.as_mut() {
-            inner
-                .send(Message::Binary(msg.into()))
-                .await
-                .map_err(|_| Closed)
-        } else {
-            Err(Closed)
-        }
+
+        self.inner
+            .send(Message::Binary(msg.into()))
+            .await
+            .map_err(|_| Closed)
     }
 
     /// Pings the client.
@@ -105,14 +103,11 @@ impl Session {
     /// ```
     pub async fn ping(&mut self, msg: &[u8]) -> Result<(), Closed> {
         self.pre_check();
-        if let Some(inner) = self.inner.as_mut() {
-            inner
-                .send(Message::Ping(Bytes::copy_from_slice(msg)))
-                .await
-                .map_err(|_| Closed)
-        } else {
-            Err(Closed)
-        }
+
+        self.inner
+            .send(Message::Ping(Bytes::copy_from_slice(msg)))
+            .await
+            .map_err(|_| Closed)
     }
 
     /// Pongs the client.
@@ -129,14 +124,11 @@ impl Session {
     /// # }
     pub async fn pong(&mut self, msg: &[u8]) -> Result<(), Closed> {
         self.pre_check();
-        if let Some(inner) = self.inner.as_mut() {
-            inner
-                .send(Message::Pong(Bytes::copy_from_slice(msg)))
-                .await
-                .map_err(|_| Closed)
-        } else {
-            Err(Closed)
-        }
+
+        self.inner
+            .send(Message::Pong(Bytes::copy_from_slice(msg)))
+            .await
+            .map_err(|_| Closed)
     }
 
     /// Manually controls sending continuations.
@@ -161,14 +153,11 @@ impl Session {
     /// ```
     pub async fn continuation(&mut self, msg: Item) -> Result<(), Closed> {
         self.pre_check();
-        if let Some(inner) = self.inner.as_mut() {
-            inner
-                .send(Message::Continuation(msg))
-                .await
-                .map_err(|_| Closed)
-        } else {
-            Err(Closed)
-        }
+
+        self.inner
+            .send(Message::Continuation(msg))
+            .await
+            .map_err(|_| Closed)
     }
 
     /// Sends a close message, and consumes the session.
@@ -184,11 +173,113 @@ impl Session {
     pub async fn close(mut self, reason: Option<CloseReason>) -> Result<(), Closed> {
         self.pre_check();
 
-        if let Some(inner) = self.inner.take() {
-            self.closed.store(true, Ordering::Relaxed);
-            inner.send(Message::Close(reason)).await.map_err(|_| Closed)
-        } else {
-            Err(Closed)
+        self.closed.store(true, Ordering::Relaxed);
+
+        self.inner
+            .send(Message::Close(reason))
+            .await
+            .map_err(|_| Closed)
+    }
+}
+
+impl Sink<Message> for Session {
+    type Error = Closed;
+
+    fn poll_ready(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        self.inner.poll_ready_unpin(cx).map_err(|_| Closed)
+    }
+
+    fn start_send(mut self: Pin<&mut Self>, item: Message) -> Result<(), Self::Error> {
+        if self.closed.load(Ordering::Relaxed) {
+            return Err(Closed);
         }
+        if let Message::Close(_) = item {
+            self.closed.store(true, Ordering::Relaxed);
+        }
+        self.inner.start_send_unpin(item).map_err(|_| Closed)
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        self.inner.poll_flush_unpin(cx).map_err(|_| Closed)
+    }
+
+    fn poll_close(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        self.inner.poll_close_unpin(cx).map_err(|_| Closed)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::sync::mpsc::channel;
+
+    #[actix_web::test]
+    async fn sent_via_sink_message_is_transmitted() {
+        let (tx, mut rx) = channel(32);
+
+        let mut session = Session::new(PollSender::new(tx));
+
+        let content = ByteString::from_static("test message");
+
+        session.send(Message::Text(content.clone())).await.unwrap();
+
+        assert_eq!(Some(Message::Text(content)), rx.recv().await);
+    }
+
+    #[actix_web::test]
+    async fn sent_directly_message_is_transmitted() {
+        let (tx, mut rx) = channel(32);
+
+        let mut session = Session::new(PollSender::new(tx));
+
+        let content = ByteString::from_static("test message");
+
+        session.text(content.clone()).await.unwrap();
+
+        assert_eq!(Some(Message::Text(content)), rx.recv().await);
+    }
+
+    #[actix_web::test]
+    async fn close_via_sink_closes_session() {
+        let (tx, _rx) = channel(32);
+
+        let mut session = Session::new(PollSender::new(tx));
+
+        session.send(Message::Close(None)).await.unwrap();
+
+        assert!(session.text("abc").await.is_err());
+    }
+
+    #[actix_web::test]
+    async fn close_via_sink_closes_sink() {
+        let (tx, _rx) = channel(32);
+
+        let mut session = Session::new(PollSender::new(tx));
+
+        session.send(Message::Close(None)).await.unwrap();
+
+        assert!(session.send(Message::Text(ByteString::from_static(""))).await.is_err());
+    }
+
+    #[actix_web::test]
+    async fn close_directly_closes_session() {
+        let (tx, _rx) = channel(32);
+
+        let mut session = Session::new(PollSender::new(tx));
+
+        session.clone().close(None).await.unwrap();
+
+        assert!(session.text("123").await.is_err());
+    }
+
+    #[actix_web::test]
+    async fn close_directly_closes_sink() {
+        let (tx, _rx) = channel(32);
+
+        let mut session = Session::new(PollSender::new(tx));
+
+        session.clone().close(None).await.unwrap();
+
+        assert!(session.send(Message::Text(ByteString::from_static("123"))).await.is_err());
     }
 }

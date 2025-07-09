@@ -4,6 +4,10 @@
 
 - Ensure TCP connection is properly shut down when session is dropped.
 
+## 0.4.0
+
+- Implement `Sink` for `Session`
+
 ## 0.3.0
 
 - Add `AggregatedMessage[Stream]` types.

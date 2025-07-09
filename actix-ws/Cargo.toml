@@ -20,7 +20,10 @@ actix-http = { version = "3", default-features = false, features = ["ws"] }
 actix-web = { version = "4", default-features = false }
 bytestring = "1"
 futures-core = "0.3.17"
+futures-sink = "0.3.17"
+futures-util = {  version = "0.3.17", features = ["sink"] }
 tokio = { version = "1.24", features = ["sync"] }
+tokio-util = "0.7"
 
 [dev-dependencies]
 actix-web = "4.8"

@@ -14,6 +14,7 @@ use actix_http::{
 };
 use actix_web::{web, HttpRequest, HttpResponse};
 use tokio::sync::mpsc::channel;
+use tokio_util::sync::PollSender;
 
 mod aggregated;
 mod session;
@@ -79,7 +80,7 @@ pub fn handle(
         response
             .message_body(BodyStream::new(StreamingBody::new(rx)).boxed())?
             .into(),
-        Session::new(tx),
+        Session::new(PollSender::new(tx)),
         MessageStream::new(body.into_inner()),
     ))
 }
